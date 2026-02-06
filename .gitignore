@@ -1,0 +1,3 @@
+POSTGRES_PASSWORD
+.env
+.DS_Store

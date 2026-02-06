@@ -1,0 +1,123 @@
+x-kong-env: &kong-env
+  KONG_DATABASE: postgres
+  KONG_PG_HOST: kong-db
+  KONG_PG_DATABASE: ${KONG_PG_DATABASE:-kong}
+  KONG_PG_USER: ${KONG_PG_USER:-kong}
+  KONG_PG_PASSWORD_FILE: /run/secrets/kong_pg_password
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL database
+  # ---------------------------------------------------------------------------
+  kong-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${KONG_PG_DATABASE:-kong}
+      POSTGRES_USER: ${KONG_PG_USER:-kong}
+      POSTGRES_PASSWORD_FILE: /run/secrets/kong_pg_password
+    secrets:
+      - kong_pg_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${KONG_PG_USER:-kong}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - kong-db-data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Kong migrations — bootstrap (first run)
+  # ---------------------------------------------------------------------------
+  kong-migrations:
+    image: kong:${KONG_VERSION:-3.9.1}
+    command: kong migrations bootstrap
+    environment:
+      <<: *kong-env
+    secrets:
+      - kong_pg_password
+    depends_on:
+      kong-db:
+        condition: service_healthy
+    restart: on-failure
+
+  # ---------------------------------------------------------------------------
+  # Kong migrations — up + finish (version upgrades)
+  # ---------------------------------------------------------------------------
+  kong-migrations-up:
+    image: kong:${KONG_VERSION:-3.9.1}
+    command: kong migrations up && kong migrations finish
+    environment:
+      <<: *kong-env
+    secrets:
+      - kong_pg_password
+    depends_on:
+      kong-db:
+        condition: service_healthy
+    restart: on-failure
+
+  # ---------------------------------------------------------------------------
+  # Kong Gateway
+  # ---------------------------------------------------------------------------
+  kong:
+    image: kong:${KONG_VERSION:-3.9.1}
+    environment:
+      <<: *kong-env
+      KONG_PROXY_LISTEN: "0.0.0.0:8000, 0.0.0.0:8443 ssl"
+      KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+    secrets:
+      - kong_pg_password
+    ports:
+      - "${KONG_PROXY_PORT:-8000}:8000"
+      - "${KONG_PROXY_SSL_PORT:-8443}:8443"
+      # Admin API is NOT exposed to the host — access via /admin-api route
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      kong-db:
+        condition: service_healthy
+      kong-migrations:
+        condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /usr/local/kong
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Kong setup — configures services, routes, and auth via Admin API
+  # ---------------------------------------------------------------------------
+  kong-setup:
+    image: curlimages/curl:latest
+    entrypoint: ["/bin/sh", "/scripts/setup-kong.sh"]
+    environment:
+      KONG_ADMIN_URL: http://kong:8001
+      VLLM_UPSTREAM_URL: ${VLLM_UPSTREAM_URL:-http://host.docker.internal:8080}
+      SGLANG_UPSTREAM_URL: ${SGLANG_UPSTREAM_URL:-http://host.docker.internal:30000}
+      KONG_ADMIN_API_KEY: ${KONG_ADMIN_API_KEY:-changeme-admin-key-secret}
+    volumes:
+      - ./scripts:/scripts:ro
+    depends_on:
+      kong:
+        condition: service_healthy
+    restart: on-failure
+
+secrets:
+  kong_pg_password:
+    file: ./POSTGRES_PASSWORD
+
+volumes:
+  kong-db-data:
