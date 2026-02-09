@@ -71,11 +71,37 @@ The PostgreSQL password is stored in the `POSTGRES_PASSWORD` file (used as a Doc
 
 ## Usage
 
-### LLM Inference
+### Unified Endpoint (Recommended)
+
+The unified `/v1/*` endpoint routes requests by the `model` field in the request body — works just like the OpenAI API:
+
+```bash
+# Chat completions — routes to the correct backend based on the model
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-70B-Instruct",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+Configure model-to-backend mappings in `config/model-routes.conf`:
+
+```
+model_name|backend_name
+meta-llama/Llama-3.1-70B-Instruct|vllm
+mistralai/Mistral-7B-Instruct-v0.3|sglang
+```
+
+After editing, restart the setup container: `docker compose restart kong-setup`
+
+### Direct Backend Endpoints
+
+Access a specific backend directly by URL prefix:
 
 ```bash
 # vLLM — chat completions
-curl http://localhost:8000/v1/vllm/v1/chat/completions \
+curl http://localhost:8000/v1/vllm/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "your-model",
@@ -83,7 +109,7 @@ curl http://localhost:8000/v1/vllm/v1/chat/completions \
   }'
 
 # SGLang — chat completions
-curl http://localhost:8000/v1/sglang/v1/chat/completions \
+curl http://localhost:8000/v1/sglang/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "your-model",
@@ -91,13 +117,13 @@ curl http://localhost:8000/v1/sglang/v1/chat/completions \
   }'
 
 # vLLM — list models
-curl http://localhost:8000/v1/vllm/v1/models
+curl http://localhost:8000/v1/vllm/models
 
 # SGLang — list models
-curl http://localhost:8000/v1/sglang/v1/models
+curl http://localhost:8000/v1/sglang/models
 ```
 
-Kong strips the `/v1/vllm` or `/v1/sglang` prefix before forwarding, so `GET /v1/vllm/v1/models` becomes `GET /v1/models` on the upstream.
+Kong strips the `/v1/{name}` prefix and prepends the service path `/v1`, so `GET /v1/vllm/models` becomes `GET /v1/models` on the upstream.
 
 ### Admin API
 

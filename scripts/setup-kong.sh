@@ -85,18 +85,36 @@ setup_backend() {
     IFS="$OLD_IFS"
 
     # Service points to upstream name (Kong resolves it internally)
+    # path=/v1 ensures the /v1 prefix is preserved after strip_path removes /v1/{name}
     call PUT "/services/$SERVICE_NAME" \
       -d "name=$SERVICE_NAME" \
       -d "protocol=$PROTOCOL" \
       -d "host=$UPSTREAM_NAME" \
+      -d "path=/v1" \
       -d "read_timeout=$TIMEOUT" \
       -d "write_timeout=$TIMEOUT" \
       -d "connect_timeout=10000"
   else
     # -- Single backend mode ---------------------------------------------------
+    # Parse URL components and set path=/v1 so the /v1 prefix is preserved
+    # after strip_path removes the /v1/{name} route prefix.
+    # e.g., /v1/vllm/chat/completions → strip /v1/vllm → /chat/completions
+    #        → prepend service path /v1 → /v1/chat/completions (correct!)
+    SVC_PROTO=$(echo "$URLS" | cut -d: -f1)
+    SVC_HOSTPORT=$(echo "$URLS" | sed 's|.*://||' | sed 's|/.*||')
+    SVC_HOST=$(echo "$SVC_HOSTPORT" | cut -d: -f1)
+    SVC_PORT=$(echo "$SVC_HOSTPORT" | cut -d: -f2 -s)
+    URL_PATH=$(echo "$URLS" | sed 's|.*://[^/]*||')
+    if [ -z "$URL_PATH" ] || [ "$URL_PATH" = "/" ]; then
+      URL_PATH="/v1"
+    fi
+
     call PUT "/services/$SERVICE_NAME" \
       -d "name=$SERVICE_NAME" \
-      -d "url=$URLS" \
+      -d "protocol=${SVC_PROTO:-http}" \
+      -d "host=$SVC_HOST" \
+      -d "port=${SVC_PORT:-80}" \
+      -d "path=$URL_PATH" \
       -d "read_timeout=$TIMEOUT" \
       -d "write_timeout=$TIMEOUT" \
       -d "connect_timeout=10000"
@@ -191,6 +209,7 @@ if [ -f "$MODEL_CONFIG" ]; then
       -d "protocol=${DFLT_PROTO:-http}" \
       -d "host=${DFLT_HOST:-localhost}" \
       -d "port=${DFLT_PORT:-80}" \
+      -d "path=/" \
       -d "read_timeout=120000" \
       -d "write_timeout=120000" \
       -d "connect_timeout=10000"
@@ -208,7 +227,12 @@ local method = kong.request.get_method()
 if method ~= "POST" and method ~= "PUT" and method ~= "PATCH" then
   return
 end
-local body, err = kong.request.get_body()
+local cjson = require("cjson.safe")
+local raw_body = kong.request.get_raw_body()
+if not raw_body then
+  return
+end
+local body = cjson.decode(raw_body)
 if not body then
   return
 end
@@ -238,11 +262,14 @@ ENDLUA
 
     LUA_CODE=$(cat /tmp/model-router.lua)
 
-    # Delete existing pre-function plugin if any, then recreate
-    EXISTING_PF=$(curl -s "$ADMIN/services/unified-llm-service/plugins" | grep -o '"id":"[^"]*"[^}]*"name":"pre-function"' | grep -o '"id":"[^"]*"' | sed 's/"id":"//;s/"//')
-    if [ -n "$EXISTING_PF" ]; then
-      call DELETE "/plugins/$EXISTING_PF"
-    fi
+    # Delete any existing pre-function plugins, then recreate
+    # (uses tr to split JSON objects for reliable field-order-independent matching)
+    curl -s "$ADMIN/services/unified-llm-service/plugins" | \
+      tr '{' '\n' | grep '"name":"pre-function"' | \
+      grep -o '"id":"[^"]*"' | sed 's/"id":"//;s/"//g' | \
+      while read -r PF_ID; do
+        [ -n "$PF_ID" ] && call DELETE "/plugins/$PF_ID"
+      done
 
     # Create the pre-function plugin with model-routing logic
     PF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$ADMIN/services/unified-llm-service/plugins" \
