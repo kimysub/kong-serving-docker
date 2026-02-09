@@ -1,3 +1,4 @@
 POSTGRES_PASSWORD
 .env
 .DS_Store
+config/backends.conf

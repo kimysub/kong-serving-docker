@@ -27,7 +27,8 @@ Your App                        Kong                         LLM Backend
 | **Route** | A URL path that maps to a service | `/v1/vllm` maps to `vllm-service` |
 | **Plugin** | Middleware that adds behavior | `key-auth` on `admin-api-service` requires an API key |
 | **Consumer** | A user/application identity | `admin` consumer with an API key |
-| **Upstream** | The actual backend URL | `http://host.docker.internal:8080` |
+| **Upstream** | A group of backend targets for load balancing | `vllm-upstream` with 3 GPU server targets |
+| **Target** | A single backend instance inside an upstream | `gpu-server1:8080` with weight 100 |
 
 ## Pre-Configured Routes
 
@@ -168,6 +169,170 @@ curl -s "http://localhost:8000/admin-api/plugins?apikey=YOUR_KEY" | python3 -m j
 curl -s "http://localhost:8000/admin-api/services/vllm-service?apikey=YOUR_KEY" | python3 -m json.tool
 ```
 
+## Adding Multiple Backends (Different Models)
+
+There are two ways to add backends: via config file (persistent across restarts) or via Admin API (immediate, runtime).
+
+### Method 1: Config File (Recommended for Permanent Backends)
+
+Edit `config/backends.conf` to add backends that are set up automatically on every start:
+
+```bash
+cp config/backends.conf.example config/backends.conf
+```
+
+Each line follows the format `name|url|timeout_ms`:
+
+```
+# Ollama server for local models
+ollama|http://host.docker.internal:11434|120000
+
+# vLLM running a code generation model
+vllm-codegen|http://host.docker.internal:8090|120000
+
+# Text Generation Inference (TGI)
+tgi|http://host.docker.internal:8082|120000
+```
+
+Then restart the setup container:
+
+```bash
+docker compose restart kong-setup
+```
+
+This creates:
+- `/v1/ollama/*` routing to your Ollama server
+- `/v1/vllm-codegen/*` routing to your code generation vLLM
+- `/v1/tgi/*` routing to your TGI server
+
+### Method 2: Admin API (For Dynamic/Temporary Backends)
+
+Add a backend at runtime without editing any files:
+
+```bash
+# 1. Create the service
+curl -X PUT "http://localhost:8000/admin-api/services/ollama-service" \
+  -H "apikey: YOUR_KEY" \
+  -d "name=ollama-service" \
+  -d "url=http://host.docker.internal:11434" \
+  -d "read_timeout=120000" \
+  -d "write_timeout=120000"
+
+# 2. Create a route for it
+curl -X PUT "http://localhost:8000/admin-api/services/ollama-service/routes/ollama-route" \
+  -H "apikey: YOUR_KEY" \
+  -d "name=ollama-route" \
+  -d "paths[]=/v1/ollama" \
+  -d "strip_path=true"
+```
+
+Now you can reach Ollama at `http://localhost:8000/v1/ollama/...`. This takes effect immediately.
+
+## Load Balancing (Same Model, Multiple Instances)
+
+When you have multiple instances serving the **same model**, Kong can distribute requests across them using round-robin.
+
+### Method 1: Config File (Comma-Separated URLs)
+
+In `.env`, use comma-separated URLs:
+
+```bash
+# Load balance vLLM across 3 GPU servers
+VLLM_UPSTREAM_URL=http://gpu-server1:8080,http://gpu-server2:8080,http://gpu-server3:8080
+```
+
+Or in `config/backends.conf`:
+
+```
+# Load balanced vLLM cluster
+vllm-cluster|http://gpu-server1:8080,http://gpu-server2:8080,http://gpu-server3:8080|180000
+```
+
+Then restart:
+
+```bash
+docker compose restart kong-setup
+```
+
+The setup script automatically creates a Kong **upstream** with **targets** for each URL.
+
+### Method 2: Admin API (Runtime Load Balancing)
+
+Set up load balancing dynamically:
+
+```bash
+# 1. Create an upstream (the load balancer group)
+curl -X PUT "http://localhost:8000/admin-api/upstreams/vllm-upstream" \
+  -H "apikey: YOUR_KEY" \
+  -d "name=vllm-upstream"
+
+# 2. Add targets (each backend instance)
+curl -X POST "http://localhost:8000/admin-api/upstreams/vllm-upstream/targets" \
+  -H "apikey: YOUR_KEY" \
+  -d "target=gpu-server1:8080" \
+  -d "weight=100"
+
+curl -X POST "http://localhost:8000/admin-api/upstreams/vllm-upstream/targets" \
+  -H "apikey: YOUR_KEY" \
+  -d "target=gpu-server2:8080" \
+  -d "weight=100"
+
+curl -X POST "http://localhost:8000/admin-api/upstreams/vllm-upstream/targets" \
+  -H "apikey: YOUR_KEY" \
+  -d "target=gpu-server3:8080" \
+  -d "weight=100"
+
+# 3. Point the service to the upstream (instead of a direct URL)
+curl -X PATCH "http://localhost:8000/admin-api/services/vllm-service" \
+  -H "apikey: YOUR_KEY" \
+  -d "host=vllm-upstream" \
+  -d "protocol=http"
+```
+
+Now every request to `/v1/vllm/*` is distributed across all three servers.
+
+### Managing Targets
+
+```bash
+# List all targets in an upstream
+curl -s "http://localhost:8000/admin-api/upstreams/vllm-upstream/targets?apikey=YOUR_KEY" \
+  | python3 -m json.tool
+
+# Add a new target (scales out)
+curl -X POST "http://localhost:8000/admin-api/upstreams/vllm-upstream/targets" \
+  -H "apikey: YOUR_KEY" \
+  -d "target=gpu-server4:8080" \
+  -d "weight=100"
+
+# Remove a target (set weight to 0)
+curl -X POST "http://localhost:8000/admin-api/upstreams/vllm-upstream/targets" \
+  -H "apikey: YOUR_KEY" \
+  -d "target=gpu-server2:8080" \
+  -d "weight=0"
+
+# Check health of all targets
+curl -s "http://localhost:8000/admin-api/upstreams/vllm-upstream/health?apikey=YOUR_KEY" \
+  | python3 -m json.tool
+```
+
+### Weighted Load Balancing
+
+Assign different weights to send more traffic to stronger servers:
+
+```bash
+# Powerful GPU server gets 3x the traffic
+curl -X POST "http://localhost:8000/admin-api/upstreams/vllm-upstream/targets" \
+  -H "apikey: YOUR_KEY" \
+  -d "target=powerful-gpu:8080" \
+  -d "weight=300"
+
+# Standard GPU server gets normal traffic
+curl -X POST "http://localhost:8000/admin-api/upstreams/vllm-upstream/targets" \
+  -H "apikey: YOUR_KEY" \
+  -d "target=standard-gpu:8080" \
+  -d "weight=100"
+```
+
 ## Common Admin Tasks
 
 ### Changing Timeouts
@@ -200,29 +365,6 @@ curl -X PATCH "http://localhost:8000/admin-api/services/vllm-service" \
 ```
 
 This takes effect immediately — no restart needed.
-
-### Adding a New LLM Backend
-
-To add a third LLM backend (e.g., an Ollama server):
-
-```bash
-# 1. Create the service
-curl -X POST "http://localhost:8000/admin-api/services" \
-  -H "apikey: YOUR_KEY" \
-  -d "name=ollama-service" \
-  -d "url=http://host.docker.internal:11434" \
-  -d "read_timeout=120000" \
-  -d "write_timeout=120000"
-
-# 2. Create a route for it
-curl -X POST "http://localhost:8000/admin-api/services/ollama-service/routes" \
-  -H "apikey: YOUR_KEY" \
-  -d "name=ollama-route" \
-  -d "paths[]=/v1/ollama" \
-  -d "strip_path=true"
-```
-
-Now you can reach Ollama at `http://localhost:8000/v1/ollama/...`.
 
 ### Adding Rate Limiting to a Service
 
@@ -374,6 +516,11 @@ Make sure your request path starts with one of the configured route prefixes (`/
 | List routes | `curl "http://localhost:8000/admin-api/routes?apikey=KEY"` |
 | List plugins | `curl "http://localhost:8000/admin-api/plugins?apikey=KEY"` |
 | List consumers | `curl "http://localhost:8000/admin-api/consumers?apikey=KEY"` |
+| List upstreams | `curl "http://localhost:8000/admin-api/upstreams?apikey=KEY"` |
+| List targets | `curl "http://localhost:8000/admin-api/upstreams/NAME-upstream/targets?apikey=KEY"` |
+| Target health | `curl "http://localhost:8000/admin-api/upstreams/NAME-upstream/health?apikey=KEY"` |
+| Add a target | `curl -X POST "http://localhost:8000/admin-api/upstreams/NAME-upstream/targets" -H "apikey: KEY" -d "target=host:port" -d "weight=100"` |
+| Remove a target | `curl -X POST "http://localhost:8000/admin-api/upstreams/NAME-upstream/targets" -H "apikey: KEY" -d "target=host:port" -d "weight=0"` |
 | Update a service | `curl -X PATCH "http://localhost:8000/admin-api/services/NAME?apikey=KEY" -d "key=value"` |
 | Delete a route | `curl -X DELETE "http://localhost:8000/admin-api/routes/NAME?apikey=KEY"` |
 | Delete a service | `curl -X DELETE "http://localhost:8000/admin-api/services/NAME?apikey=KEY"` |

@@ -110,6 +110,7 @@ services:
       KONG_ADMIN_API_KEY: ${KONG_ADMIN_API_KEY:-changeme-admin-key-secret}
     volumes:
       - ./scripts:/scripts:ro
+      - ./config:/config:ro
     depends_on:
       kong:
         condition: service_healthy

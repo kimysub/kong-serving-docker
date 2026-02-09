@@ -80,11 +80,14 @@ echo 'pick-a-strong-password-here' > POSTGRES_PASSWORD
 Open `.env` in any text editor and set the URLs where your LLM backends are running:
 
 ```bash
-# If vLLM is running on port 8080 on the same machine:
+# Single vLLM backend:
 VLLM_UPSTREAM_URL=http://host.docker.internal:8080
 
-# If SGLang is running on port 30000 on the same machine:
+# Single SGLang backend:
 SGLANG_UPSTREAM_URL=http://host.docker.internal:30000
+
+# OR load balance across multiple vLLM instances (comma-separated):
+VLLM_UPSTREAM_URL=http://gpu-server1:8080,http://gpu-server2:8080,http://gpu-server3:8080
 ```
 
 **What is `host.docker.internal`?** It is a special DNS name that lets containers reach services running on your host machine. Docker resolves this automatically.
@@ -92,6 +95,27 @@ SGLANG_UPSTREAM_URL=http://host.docker.internal:30000
 **Port conflict warning**: Both Kong and vLLM default to port 8000. If your vLLM uses port 8000, either:
 - Start vLLM on a different port: `--port 8080`
 - Or change Kong's port in `.env`: `KONG_PROXY_PORT=9000`
+
+### Step 4b: Add Extra Backends (Optional)
+
+For backends beyond vLLM and SGLang, create a config file:
+
+```bash
+cp config/backends.conf.example config/backends.conf
+```
+
+Edit `config/backends.conf` — each line adds a new route:
+
+```
+# Format: name|url|timeout_ms
+# Single backend:
+ollama|http://host.docker.internal:11434|120000
+
+# Load balanced cluster:
+vllm-cluster|http://gpu1:8080,http://gpu2:8080,http://gpu3:8080|180000
+```
+
+This creates routes at `/v1/ollama/*` and `/v1/vllm-cluster/*`.
 
 ### Step 5: Set Your Admin API Key
 
@@ -145,8 +169,8 @@ docker compose logs kong-setup
 You should see lines like:
 
 ```
-[OK]      POST /services (201)
-[OK]      POST /services/vllm-service/routes (201)
+[OK]      PUT /services/vllm-service (200)
+[OK]      PUT /services/vllm-service/routes/vllm-route (200)
 ...
 === Kong setup complete ===
 ```

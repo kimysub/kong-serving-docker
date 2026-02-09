@@ -1,0 +1,35 @@
+# =============================================================================
+# Extra Backend Configuration
+# =============================================================================
+# Copy this file to backends.conf and uncomment the lines you need:
+#   cp backends.conf.example backends.conf
+#
+# Format: name|url|read_timeout_ms
+#
+# - name:    route path will be /v1/{name}/* (strip_path enabled)
+# - url:     single URL for direct proxy, comma-separated for load balancing
+# - timeout: read/write timeout in milliseconds (default: 120000 = 2 min)
+#
+# Lines starting with # are ignored. Empty lines are ignored.
+# =============================================================================
+
+# -- Single backend examples ---------------------------------------------------
+# Each gets its own route: /v1/{name}/*
+
+# Ollama
+# ollama|http://host.docker.internal:11434|120000
+
+# Text Generation Inference (TGI)
+# tgi|http://host.docker.internal:8082|120000
+
+# Another vLLM with a different model
+# vllm-codegen|http://host.docker.internal:8090|120000
+
+# -- Load balanced examples (round-robin across multiple instances) ------------
+# Comma-separated URLs → Kong creates an upstream with targets
+
+# vLLM cluster (3 GPU servers, same model)
+# vllm-cluster|http://gpu-server1:8080,http://gpu-server2:8080,http://gpu-server3:8080|180000
+
+# SGLang cluster (2 instances)
+# sglang-cluster|http://gpu-server1:30000,http://gpu-server2:30000|180000
