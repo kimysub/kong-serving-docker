@@ -93,8 +93,8 @@ services:
     security_opt:
       - no-new-privileges:true
     tmpfs:
-      - /tmp
-      - /usr/local/kong
+      - /tmp:uid=1000,gid=1000
+      - /usr/local/kong:uid=1000,gid=1000
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
