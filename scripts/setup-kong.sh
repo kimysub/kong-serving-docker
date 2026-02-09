@@ -234,7 +234,55 @@ if [ -f "$MODEL_CONFIG" ]; then
     cat > /tmp/model-router.lua <<ENDLUA
 local ROUTES = {$LUA_MAP
 }
+
 local method = kong.request.get_method()
+local path = kong.request.get_path()
+
+-- =========================================================================
+-- GET /v1/models — return all client-facing model names (OpenAI-compatible)
+-- GET /v1/models/{id} — return details for a specific model
+-- =========================================================================
+if method == "GET" then
+  if path == "/v1/models" or path == "/v1/models/" then
+    local models = {}
+    local now = ngx.time()
+    for name, _ in pairs(ROUTES) do
+      models[#models + 1] = {
+        id = name,
+        object = "model",
+        created = now,
+        owned_by = "kong-gateway"
+      }
+    end
+    return kong.response.exit(200, {
+      object = "list",
+      data = models
+    })
+  end
+  local model_id = path:match("^/v1/models/(.+)$")
+  if model_id then
+    if ROUTES[model_id] then
+      return kong.response.exit(200, {
+        id = model_id,
+        object = "model",
+        created = ngx.time(),
+        owned_by = "kong-gateway"
+      })
+    else
+      return kong.response.exit(404, {
+        error = {
+          message = "No model found: " .. model_id,
+          type = "invalid_request_error"
+        }
+      })
+    end
+  end
+  return
+end
+
+-- =========================================================================
+-- POST/PUT/PATCH — route by "model" field in request body
+-- =========================================================================
 if method ~= "POST" and method ~= "PUT" and method ~= "PATCH" then
   return
 end
