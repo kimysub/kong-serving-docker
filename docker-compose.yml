@@ -11,6 +11,7 @@ services:
   # ---------------------------------------------------------------------------
   kong-db:
     image: postgres:17-alpine
+    command: postgres -c max_connections=200
     environment:
       POSTGRES_DB: ${KONG_PG_DATABASE:-kong}
       POSTGRES_USER: ${KONG_PG_USER:-kong}
@@ -56,6 +57,8 @@ services:
     depends_on:
       kong-db:
         condition: service_healthy
+      kong-migrations:
+        condition: service_completed_successfully
     restart: on-failure
 
   # ---------------------------------------------------------------------------
@@ -89,12 +92,8 @@ services:
         condition: service_completed_successfully
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    read_only: true
     security_opt:
       - no-new-privileges:true
-    tmpfs:
-      - /tmp:uid=1000,gid=1000
-      - /usr/local/kong:uid=1000,gid=1000
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
