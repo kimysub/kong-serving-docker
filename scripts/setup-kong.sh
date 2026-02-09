@@ -227,12 +227,7 @@ local method = kong.request.get_method()
 if method ~= "POST" and method ~= "PUT" and method ~= "PATCH" then
   return
 end
-local cjson = require("cjson.safe")
-local raw_body = kong.request.get_raw_body()
-if not raw_body then
-  return
-end
-local body = cjson.decode(raw_body)
+local body, err = kong.request.get_body("application/json")
 if not body then
   return
 end
