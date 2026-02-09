@@ -6,14 +6,17 @@ A Docker Compose stack that runs **Kong Gateway OSS 3.9.1** as a reverse proxy f
 
 ```
 Client → Kong Gateway (port 8000/8443)
-              ├── /v1/vllm/*    → vLLM backend (external)
-              ├── /v1/sglang/*  → SGLang backend (external)
-              └── /admin-api/*  → Kong Admin API (key-auth protected, loopback)
+              ├── /v1/*          → Unified endpoint (routes by model name)
+              ├── /v1/vllm/*     → vLLM backend (direct)
+              ├── /v1/sglang/*   → SGLang backend (direct)
+              └── /admin-api/*   → Kong Admin API (key-auth protected, loopback)
               │
               └── PostgreSQL (internal, port 5432)
 ```
 
 - **Kong** runs in DB mode with **PostgreSQL 17**
+- **Unified endpoint** (`/v1/*`) reads the `model` field and routes to the correct backend — works like the OpenAI API
+- **Direct endpoints** (`/v1/vllm/*`, `/v1/sglang/*`) route by URL prefix to a specific backend
 - Admin API listens on `0.0.0.0:8001` inside the container but is **not exposed** to the host
 - Admin access is available via the `/admin-api` route, protected by `key-auth`
 - LLM backends run outside the compose stack and are configured via environment variables

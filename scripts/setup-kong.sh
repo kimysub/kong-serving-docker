@@ -16,6 +16,7 @@ set -e
 
 ADMIN="${KONG_ADMIN_URL:-http://kong:8001}"
 CONFIG_FILE="/config/backends.conf"
+MODEL_CONFIG="/config/model-routes.conf"
 
 # -- helpers ------------------------------------------------------------------
 call() {
@@ -134,6 +135,134 @@ if [ -f "$CONFIG_FILE" ]; then
 else
   echo ""
   echo "[INFO]    No config file found at $CONFIG_FILE (optional)"
+fi
+
+# -- Unified /v1 endpoint (model-based routing via pre-function plugin) --------
+if [ -f "$MODEL_CONFIG" ]; then
+  echo ""
+  echo "--- Unified LLM Endpoint (/v1) ---"
+
+  # Build the Lua model-routing table by resolving each backend
+  LUA_MAP=""
+  DEFAULT_BACKEND=""
+
+  while IFS='|' read -r MODEL_NAME BACKEND || [ -n "$MODEL_NAME" ]; do
+    # Skip comments and empty lines
+    case "$MODEL_NAME" in \#*|"") continue ;; esac
+
+    # Remember first backend as default fallback
+    if [ -z "$DEFAULT_BACKEND" ]; then
+      DEFAULT_BACKEND="$BACKEND"
+    fi
+
+    # Check if this backend has an upstream (load balanced)
+    UP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ADMIN/upstreams/${BACKEND}-upstream")
+
+    if [ "$UP_STATUS" -eq 200 ]; then
+      LUA_MAP="${LUA_MAP}  [\"${MODEL_NAME}\"] = { upstream = \"${BACKEND}-upstream\" },"
+      echo "[MAP]     $MODEL_NAME -> upstream:${BACKEND}-upstream"
+    else
+      # Get service details (host, port, protocol)
+      SVC_JSON=$(curl -s "$ADMIN/services/${BACKEND}-service")
+      SVC_HOST=$(echo "$SVC_JSON" | grep -o '"host":"[^"]*"' | head -1 | sed 's/"host":"//;s/"//')
+      SVC_PORT=$(echo "$SVC_JSON" | grep -o '"port":[0-9]*' | head -1 | sed 's/"port"://')
+      SVC_PROTO=$(echo "$SVC_JSON" | grep -o '"protocol":"[^"]*"' | head -1 | sed 's/"protocol":"//;s/"//')
+
+      if [ -n "$SVC_HOST" ]; then
+        LUA_MAP="${LUA_MAP}  [\"${MODEL_NAME}\"] = { scheme = \"${SVC_PROTO:-http}\", host = \"${SVC_HOST}\", port = ${SVC_PORT:-80} },"
+        echo "[MAP]     $MODEL_NAME -> ${SVC_PROTO:-http}://${SVC_HOST}:${SVC_PORT:-80}"
+      else
+        echo "[WARN]    Backend '${BACKEND}' not found, skipping model '${MODEL_NAME}'"
+      fi
+    fi
+  done < "$MODEL_CONFIG"
+
+  if [ -z "$LUA_MAP" ]; then
+    echo "[WARN]    No model routes configured, skipping unified endpoint"
+  else
+    # Create unified service (uses first backend as fallback for non-POST requests)
+    DFLT_JSON=$(curl -s "$ADMIN/services/${DEFAULT_BACKEND}-service")
+    DFLT_HOST=$(echo "$DFLT_JSON" | grep -o '"host":"[^"]*"' | head -1 | sed 's/"host":"//;s/"//')
+    DFLT_PORT=$(echo "$DFLT_JSON" | grep -o '"port":[0-9]*' | head -1 | sed 's/"port"://')
+    DFLT_PROTO=$(echo "$DFLT_JSON" | grep -o '"protocol":"[^"]*"' | head -1 | sed 's/"protocol":"//;s/"//')
+
+    call PUT /services/unified-llm-service \
+      -d "name=unified-llm-service" \
+      -d "protocol=${DFLT_PROTO:-http}" \
+      -d "host=${DFLT_HOST:-localhost}" \
+      -d "port=${DFLT_PORT:-80}" \
+      -d "read_timeout=120000" \
+      -d "write_timeout=120000" \
+      -d "connect_timeout=10000"
+
+    call PUT /services/unified-llm-service/routes/unified-llm-route \
+      -d "name=unified-llm-route" \
+      -d "paths[]=/v1" \
+      -d "strip_path=false"
+
+    # Write the Lua router code to a temp file
+    cat > /tmp/model-router.lua <<ENDLUA
+local ROUTES = {$LUA_MAP
+}
+local method = kong.request.get_method()
+if method ~= "POST" and method ~= "PUT" and method ~= "PATCH" then
+  return
+end
+local body, err = kong.request.get_body()
+if not body then
+  return
+end
+local model = body.model
+if not model then
+  return
+end
+local route = ROUTES[model]
+if not route then
+  for pattern, r in pairs(ROUTES) do
+    if model:find(pattern, 1, true) == 1 then
+      route = r
+      break
+    end
+  end
+end
+if not route then
+  return kong.response.exit(404, { error = { message = "No backend configured for model: " .. model, type = "invalid_request_error" } })
+end
+if route.upstream then
+  kong.service.set_upstream(route.upstream)
+elseif route.host then
+  kong.service.request.set_scheme(route.scheme or "http")
+  kong.service.set_target(route.host, route.port or 80)
+end
+ENDLUA
+
+    LUA_CODE=$(cat /tmp/model-router.lua)
+
+    # Delete existing pre-function plugin if any, then recreate
+    EXISTING_PF=$(curl -s "$ADMIN/services/unified-llm-service/plugins" | grep -o '"id":"[^"]*"[^}]*"name":"pre-function"' | grep -o '"id":"[^"]*"' | sed 's/"id":"//;s/"//')
+    if [ -n "$EXISTING_PF" ]; then
+      call DELETE "/plugins/$EXISTING_PF"
+    fi
+
+    # Create the pre-function plugin with model-routing logic
+    PF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$ADMIN/services/unified-llm-service/plugins" \
+      -d "name=pre-function" \
+      --data-urlencode "config.access[]=$LUA_CODE")
+    if [ "$PF_STATUS" -ge 200 ] && [ "$PF_STATUS" -lt 300 ]; then
+      echo "[OK]      pre-function plugin on unified-llm-service ($PF_STATUS)"
+    else
+      echo "[ERROR]   pre-function plugin ($PF_STATUS)"
+      curl -s -X POST "$ADMIN/services/unified-llm-service/plugins" \
+        -d "name=pre-function" \
+        --data-urlencode "config.access[]=$LUA_CODE"
+      echo ""
+    fi
+
+    rm -f /tmp/model-router.lua
+  fi
+else
+  echo ""
+  echo "[INFO]    No model-routes.conf found, skipping unified endpoint"
 fi
 
 # -- Admin API loopback service + route + key-auth -----------------------------

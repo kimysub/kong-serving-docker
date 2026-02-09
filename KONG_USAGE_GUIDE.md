@@ -9,11 +9,14 @@ Kong is a **reverse proxy**. It sits between your application and your LLM backe
 ```
 Your App                        Kong                         LLM Backend
    │                             │                              │
+   ├── POST /v1/chat/completions►├── reads "model" field ─────► │ Routes to correct backend
+   │  {"model":"llama-3"}        │   (pre-function plugin)      │ (unified endpoint)
+   │                             │                              │
    ├── POST /v1/vllm/v1/chat ──►├── strips "/v1/vllm" ──────► │ POST /v1/chat
-   │                             │   forwards to vLLM           │
+   │                             │   forwards to vLLM           │ (direct endpoint)
    │                             │                              │
    ├── POST /v1/sglang/v1/chat ►├── strips "/v1/sglang" ─────► │ POST /v1/chat
-   │                             │   forwards to SGLang         │
+   │                             │   forwards to SGLang         │ (direct endpoint)
    │                             │                              │
    └── GET /admin-api/services ►├── checks API key ──────────► │ Kong Admin API
                                  │   (key-auth plugin)          │ (internal)
@@ -30,17 +33,112 @@ Your App                        Kong                         LLM Backend
 | **Upstream** | A group of backend targets for load balancing | `vllm-upstream` with 3 GPU server targets |
 | **Target** | A single backend instance inside an upstream | `gpu-server1:8080` with weight 100 |
 
-## Pre-Configured Routes
+## Two Ways to Call LLM Backends
 
-This stack comes with three routes already configured:
+This stack supports two request patterns:
+
+| Pattern | Route | How It Works |
+|---|---|---|
+| **Unified endpoint** | `/v1/chat/completions` | Kong reads the `model` field from the body and routes to the correct backend |
+| **Direct endpoint** | `/v1/vllm/v1/chat/completions` | Kong routes by URL prefix to a specific backend |
+
+The unified endpoint works like the OpenAI API — one base URL, model selection in the request body. The direct endpoints let you target a specific backend explicitly.
+
+### Pre-Configured Routes
 
 | Route | Backend | Auth Required? | Purpose |
 |---|---|---|---|
-| `/v1/vllm/*` | vLLM server | No | LLM inference via vLLM |
-| `/v1/sglang/*` | SGLang server | No | LLM inference via SGLang |
+| `/v1/*` | Model-based routing | No | Unified endpoint (requires `config/model-routes.conf`) |
+| `/v1/vllm/*` | vLLM server | No | Direct access to vLLM |
+| `/v1/sglang/*` | SGLang server | No | Direct access to SGLang |
 | `/admin-api/*` | Kong Admin API | Yes (API key) | Manage Kong configuration |
 
+## Setting Up the Unified Endpoint
+
+The unified endpoint requires a model-to-backend mapping file.
+
+### Step 1: Create the model routes config
+
+```bash
+cp config/model-routes.conf.example config/model-routes.conf
+```
+
+### Step 2: Map your models to backends
+
+Edit `config/model-routes.conf`:
+
+```
+# Format: model_name|backend_name
+meta-llama/Llama-3.1-70B-Instruct|vllm
+mistralai/Mistral-7B-Instruct-v0.3|sglang
+deepseek-ai/DeepSeek-Coder-V2|vllm-codegen
+```
+
+The `backend_name` must match a backend configured in `.env` (vllm, sglang) or `config/backends.conf`.
+
+### Step 3: Restart the setup container
+
+```bash
+docker compose restart kong-setup
+```
+
+Check the logs to verify:
+
+```bash
+docker compose logs kong-setup
+```
+
+You should see:
+
+```
+--- Unified LLM Endpoint (/v1) ---
+[MAP]     meta-llama/Llama-3.1-70B-Instruct -> http://host.docker.internal:8080
+[MAP]     mistralai/Mistral-7B-Instruct-v0.3 -> http://host.docker.internal:30000
+[OK]      PUT /services/unified-llm-service (200)
+[OK]      PUT /services/unified-llm-service/routes/unified-llm-route (200)
+[OK]      pre-function plugin on unified-llm-service (201)
+```
+
+### How It Works
+
+When a POST request arrives at `/v1/chat/completions`:
+
+1. Kong's `pre-function` plugin reads the request body
+2. Extracts the `model` field
+3. Looks up the model in the routing table
+4. Routes the request to the correct backend
+
+For GET requests (like `/v1/models`), the request goes to the default backend (the first one in your config).
+
 ## Making LLM Requests
+
+### Unified Endpoint (Recommended)
+
+Use a single base URL for all models — just like the OpenAI API:
+
+```bash
+# Model served by vLLM
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-70B-Instruct",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+
+# Model served by SGLang — same endpoint, different model
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+Kong reads the `model` field and routes to the right backend automatically.
+
+### Direct Endpoints
+
+You can also target a specific backend by URL prefix:
 
 ### Chat Completions
 
@@ -422,30 +520,49 @@ curl http://localhost:8000/v1/vllm/v1/models \
 
 ## Using Kong with Python (OpenAI SDK)
 
-Since vLLM and SGLang are OpenAI-compatible, you can use the OpenAI Python SDK with Kong as the base URL:
+Since vLLM and SGLang are OpenAI-compatible, you can use the OpenAI Python SDK with Kong.
+
+### Unified Endpoint (Recommended)
+
+With the unified endpoint configured, use Kong just like the OpenAI API — one base URL, switch models by name:
 
 ```python
 from openai import OpenAI
 
-# Point the OpenAI client at Kong's vLLM route
+# Single client for ALL models — Kong routes by model name
 client = OpenAI(
-    base_url="http://localhost:8000/v1/vllm/v1",
-    api_key="not-needed",  # unless you added key-auth to vLLM
+    base_url="http://localhost:8000/v1",
+    api_key="not-needed",  # unless you added key-auth
 )
 
+# This goes to vLLM (if model-routes.conf maps it there)
 response = client.chat.completions.create(
-    model="your-model-name",
-    messages=[
-        {"role": "user", "content": "Hello!"}
-    ],
+    model="meta-llama/Llama-3.1-70B-Instruct",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
+
+# This goes to SGLang (same client, different model)
+response = client.chat.completions.create(
+    model="mistralai/Mistral-7B-Instruct-v0.3",
+    messages=[{"role": "user", "content": "Hello!"}],
 )
 print(response.choices[0].message.content)
 ```
 
-For SGLang, change the `base_url`:
+### Direct Endpoints
+
+You can also target a specific backend by URL:
 
 ```python
-client = OpenAI(
+# Direct to vLLM
+vllm_client = OpenAI(
+    base_url="http://localhost:8000/v1/vllm/v1",
+    api_key="not-needed",
+)
+
+# Direct to SGLang
+sglang_client = OpenAI(
     base_url="http://localhost:8000/v1/sglang/v1",
     api_key="not-needed",
 )
@@ -455,8 +572,8 @@ If you added `key-auth` to the LLM routes, pass the API key:
 
 ```python
 client = OpenAI(
-    base_url="http://localhost:8000/v1/vllm/v1",
-    api_key="my-app-secret-key",  # used as the apikey header
+    base_url="http://localhost:8000/v1",
+    api_key="my-app-secret-key",
     default_headers={"apikey": "my-app-secret-key"},
 )
 ```

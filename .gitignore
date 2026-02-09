@@ -2,3 +2,4 @@ POSTGRES_PASSWORD
 .env
 .DS_Store
 config/backends.conf
+config/model-routes.conf
