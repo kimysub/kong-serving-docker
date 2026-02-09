@@ -164,21 +164,32 @@ if [ -f "$MODEL_CONFIG" ]; then
   LUA_MAP=""
   DEFAULT_BACKEND=""
 
-  while IFS='|' read -r MODEL_NAME BACKEND || [ -n "$MODEL_NAME" ]; do
+  while IFS='|' read -r MODEL_NAME BACKEND REAL_MODEL || [ -n "$MODEL_NAME" ]; do
     # Skip comments and empty lines
     case "$MODEL_NAME" in \#*|"") continue ;; esac
+
+    # Strip whitespace/CR from optional third field
+    REAL_MODEL=$(printf '%s' "$REAL_MODEL" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
     # Remember first backend as default fallback
     if [ -z "$DEFAULT_BACKEND" ]; then
       DEFAULT_BACKEND="$BACKEND"
     fi
 
+    # Build optional model-rewrite field for Lua table
+    # When REAL_MODEL is set, the Lua code will rewrite the "model" field
+    # in the request body before forwarding to the backend.
+    MODEL_FIELD=""
+    if [ -n "$REAL_MODEL" ]; then
+      MODEL_FIELD=", model = \"${REAL_MODEL}\""
+    fi
+
     # Check if this backend has an upstream (load balanced)
     UP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$ADMIN/upstreams/${BACKEND}-upstream")
 
     if [ "$UP_STATUS" -eq 200 ]; then
-      LUA_MAP="${LUA_MAP}  [\"${MODEL_NAME}\"] = { upstream = \"${BACKEND}-upstream\" },"
-      echo "[MAP]     $MODEL_NAME -> upstream:${BACKEND}-upstream"
+      LUA_MAP="${LUA_MAP}  [\"${MODEL_NAME}\"] = { upstream = \"${BACKEND}-upstream\"${MODEL_FIELD} },"
+      echo "[MAP]     $MODEL_NAME -> upstream:${BACKEND}-upstream${REAL_MODEL:+ (rewrite -> $REAL_MODEL)}"
     else
       # Get service details (host, port, protocol)
       SVC_JSON=$(curl -s "$ADMIN/services/${BACKEND}-service")
@@ -187,8 +198,8 @@ if [ -f "$MODEL_CONFIG" ]; then
       SVC_PROTO=$(echo "$SVC_JSON" | grep -o '"protocol":"[^"]*"' | head -1 | sed 's/"protocol":"//;s/"//')
 
       if [ -n "$SVC_HOST" ]; then
-        LUA_MAP="${LUA_MAP}  [\"${MODEL_NAME}\"] = { scheme = \"${SVC_PROTO:-http}\", host = \"${SVC_HOST}\", port = ${SVC_PORT:-80} },"
-        echo "[MAP]     $MODEL_NAME -> ${SVC_PROTO:-http}://${SVC_HOST}:${SVC_PORT:-80}"
+        LUA_MAP="${LUA_MAP}  [\"${MODEL_NAME}\"] = { scheme = \"${SVC_PROTO:-http}\", host = \"${SVC_HOST}\", port = ${SVC_PORT:-80}${MODEL_FIELD} },"
+        echo "[MAP]     $MODEL_NAME -> ${SVC_PROTO:-http}://${SVC_HOST}:${SVC_PORT:-80}${REAL_MODEL:+ (rewrite -> $REAL_MODEL)}"
       else
         echo "[WARN]    Backend '${BACKEND}' not found, skipping model '${MODEL_NAME}'"
       fi
@@ -252,6 +263,10 @@ if route.upstream then
 elseif route.host then
   kong.service.request.set_scheme(route.scheme or "http")
   kong.service.set_target(route.host, route.port or 80)
+end
+if route.model then
+  body.model = route.model
+  kong.service.request.set_body(body, "application/json")
 end
 ENDLUA
 

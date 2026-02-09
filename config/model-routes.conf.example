@@ -5,11 +5,15 @@
 # This lets clients use a single endpoint and specify the model in the request body,
 # just like the OpenAI API.
 #
-# Format: model_name|backend_name
+# Format: kong_model_name|backend_name[|backend_model_name]
 #
-# - model_name: the value clients send in the "model" field (exact match first, then prefix)
-# - backend_name: must match a backend configured in .env or config/backends.conf
-#   (e.g., "vllm", "sglang", "ollama", "vllm-cluster")
+# - kong_model_name:    the value clients send in the "model" field
+#                       (exact match first, then prefix match)
+# - backend_name:       must match a backend configured in .env or config/backends.conf
+#                       (e.g., "vllm", "sglang", "ollama", "vllm-cluster")
+# - backend_model_name: (optional) the actual model name on the backend.
+#                       If set, Kong rewrites the "model" field before forwarding.
+#                       If omitted, the model name is passed through as-is.
 #
 # Copy this file to model-routes.conf and uncomment/edit:
 #   cp model-routes.conf.example model-routes.conf
@@ -18,11 +22,16 @@
 #   docker compose restart kong-setup
 # =============================================================================
 
-# Example: route models to different backends
+# -- Pass-through examples (model name used as-is) ---------------------------
 # meta-llama/Llama-3.1-70B-Instruct|vllm
 # mistralai/Mistral-7B-Instruct-v0.3|sglang
 # deepseek-ai/DeepSeek-Coder-V2|vllm-codegen
 # codellama/CodeLlama-34b-Instruct-hf|ollama
 
-# Example: route to a load-balanced cluster (defined in backends.conf)
-# meta-llama/Llama-3.1-70B-Instruct|vllm-cluster
+# -- Alias examples (clients use a short name, Kong rewrites to real name) ----
+# my-llama|vllm|meta-llama/Llama-3.1-70B-Instruct
+# mistral-7b|sglang|mistralai/Mistral-7B-Instruct-v0.3
+# deepseek-coder|vllm-codegen|deepseek-ai/DeepSeek-Coder-V2
+
+# -- Load-balanced cluster (defined in backends.conf) -------------------------
+# my-llama|vllm-cluster|meta-llama/Llama-3.1-70B-Instruct
